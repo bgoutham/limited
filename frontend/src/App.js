@@ -1,7 +1,14 @@
 import { useState, useEffect } from "react";
 import "./App.css";
-import { BrowserRouter, Routes, Route, Link } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Link, Navigate } from "react-router-dom";
 import axios from "axios";
+import { AuthProvider, useAuth } from "./AuthContext";
+import ProtectedRoute from "./components/auth/ProtectedRoute";
+import LoginForm from "./components/auth/LoginForm";
+import RegisterForm from "./components/auth/RegisterForm";
+import ProfilePage from "./components/profile/ProfilePage";
+import PortfolioPage from "./components/portfolio/PortfolioPage";
+import FundDetail from "./components/funds/FundDetail";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
 const API = `${BACKEND_URL}/api`;
