@@ -1,15 +1,20 @@
-from fastapi import FastAPI, APIRouter, HTTPException
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 from pathlib import Path
-from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
+from pydantic import BaseModel, Field, EmailStr
+from typing import List, Optional, Dict, Any, Union
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
+import jwt
+from passlib.context import CryptContext
+import re
+from email_validator import validate_email, EmailNotValidError
 
 
 ROOT_DIR = Path(__file__).parent
@@ -25,6 +30,17 @@ app = FastAPI()
 
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
+
+# JWT settings
+SECRET_KEY = os.environ.get("JWT_SECRET_KEY", "default_secret_key_for_development")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 1 week
+
+# Password hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# OAuth2 token URL
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/token")
 
 
 class FundType(str, Enum):
@@ -56,6 +72,65 @@ class Sector(str, Enum):
     MEDIA = "Media/Entertainment"
     INVESTMENT = "Investment Platform"
     COLLABORATION = "Collaboration Tools"
+
+
+class UserType(str, Enum):
+    LP = "Limited Partner"
+    FUND_MANAGER = "Fund Manager"
+    ADMIN = "Admin"
+
+
+class UserStatus(str, Enum):
+    PENDING_VERIFICATION = "Pending Verification"
+    VERIFIED = "Verified"
+    SUSPENDED = "Suspended"
+
+
+# Auth models
+class TokenData(BaseModel):
+    user_id: str
+    email: str
+    user_type: UserType
+    is_verified: bool = False
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    user: TokenData
+
+
+class UserBase(BaseModel):
+    email: EmailStr
+    first_name: str
+    last_name: str
+    company_name: Optional[str] = None
+    user_type: UserType = UserType.LP
+    is_accredited: bool = False
+    status: UserStatus = UserStatus.PENDING_VERIFICATION
+
+
+class UserCreate(UserBase):
+    password: str
+
+
+class UserUpdate(BaseModel):
+    email: Optional[EmailStr] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    company_name: Optional[str] = None
+    is_accredited: Optional[bool] = None
+    status: Optional[UserStatus] = None
+
+
+class User(UserBase):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class UserInDB(User):
+    hashed_password: str
 
 
 # Define Models
@@ -154,9 +229,232 @@ class FeaturedFund(BaseModel):
     performance: Optional[str] = None
 
 
+class Investment(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    user_id: str
+    fund_id: str
+    amount: int
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    status: str = "Pending"  # Pending, Completed, Cancelled
+
+
+class InvestmentCreate(BaseModel):
+    fund_id: str
+    amount: int
+
+
+# Security functions
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+
+async def get_user_by_email(email: str):
+    user = await db.users.find_one({"email": email.lower()})
+    if user:
+        return UserInDB(**user)
+    return None
+
+
+async def authenticate_user(email: str, password: str):
+    user = await get_user_by_email(email)
+    if not user:
+        return False
+    if not verify_password(password, user.hashed_password):
+        return False
+    return user
+
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        email: str = payload.get("email")
+        user_type: str = payload.get("user_type")
+        if user_id is None or email is None:
+            raise credentials_exception
+        token_data = TokenData(user_id=user_id, email=email, user_type=UserType(user_type))
+    except jwt.PyJWTError:
+        raise credentials_exception
+    user = await db.users.find_one({"id": user_id})
+    if user is None:
+        raise credentials_exception
+    return User(**user)
+
+
+async def get_current_active_user(current_user: User = Depends(get_current_user)):
+    if current_user.status == UserStatus.SUSPENDED:
+        raise HTTPException(status_code=400, detail="User account is suspended")
+    return current_user
+
+
+# Authentication Routes
+@api_router.post("/auth/register", response_model=User)
+async def register_user(user: UserCreate):
+    # Check if email is valid
+    try:
+        valid = validate_email(user.email)
+        email = valid.email
+    except EmailNotValidError:
+        raise HTTPException(status_code=400, detail="Invalid email address")
+    
+    # Check if user already exists
+    existing_user = await get_user_by_email(email)
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    # Validate password
+    if len(user.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    
+    # Create new user
+    hashed_password = get_password_hash(user.password)
+    user_data = user.dict()
+    user_data.pop("password")
+    user_data["email"] = email.lower()
+    user_id = str(uuid.uuid4())
+    user_data["id"] = user_id
+    user_data["created_at"] = datetime.utcnow()
+    user_data["updated_at"] = datetime.utcnow()
+    user_data["hashed_password"] = hashed_password
+    
+    await db.users.insert_one(user_data)
+    
+    return User(**user_data)
+
+
+@api_router.post("/auth/token", response_model=Token)
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
+    user = await authenticate_user(form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    token_data = {
+        "sub": user.id,
+        "email": user.email,
+        "user_type": user.user_type
+    }
+    
+    access_token = create_access_token(token_data)
+    
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": TokenData(
+            user_id=user.id,
+            email=user.email,
+            user_type=user.user_type,
+            is_verified=user.status == UserStatus.VERIFIED
+        )
+    }
+
+
+@api_router.get("/auth/me", response_model=User)
+async def read_users_me(current_user: User = Depends(get_current_active_user)):
+    return current_user
+
+
+@api_router.put("/auth/me", response_model=User)
+async def update_user(update_data: UserUpdate, current_user: User = Depends(get_current_active_user)):
+    user_data = update_data.dict(exclude_unset=True)
+    if user_data:
+        user_data["updated_at"] = datetime.utcnow()
+        await db.users.update_one({"id": current_user.id}, {"$set": user_data})
+    
+    updated_user = await db.users.find_one({"id": current_user.id})
+    return User(**updated_user)
+
+
+# Investment Routes
+@api_router.post("/investments", response_model=Investment)
+async def create_investment(investment: InvestmentCreate, current_user: User = Depends(get_current_active_user)):
+    # Check if fund exists
+    fund = await db.funds.find_one({"id": investment.fund_id})
+    if not fund:
+        raise HTTPException(status_code=404, detail="Fund not found")
+    
+    # Check if investment amount meets minimum requirement
+    if investment.amount < fund["min_investment"]:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Investment amount must be at least {fund['min_investment']}"
+        )
+    
+    # Create investment record
+    investment_data = {
+        "id": str(uuid.uuid4()),
+        "user_id": current_user.id,
+        "fund_id": investment.fund_id,
+        "amount": investment.amount,
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
+        "status": "Pending"
+    }
+    
+    await db.investments.insert_one(investment_data)
+    
+    return Investment(**investment_data)
+
+
+@api_router.get("/investments", response_model=List[dict])
+async def get_user_investments(current_user: User = Depends(get_current_active_user)):
+    # Get user's investments with fund details
+    pipeline = [
+        {"$match": {"user_id": current_user.id}},
+        {"$lookup": {
+            "from": "funds",
+            "localField": "fund_id",
+            "foreignField": "id",
+            "as": "fund"
+        }},
+        {"$unwind": "$fund"},
+        {"$project": {
+            "id": 1,
+            "amount": 1,
+            "status": 1,
+            "created_at": 1,
+            "fund_id": 1,
+            "fund_name": "$fund.name",
+            "fund_symbol": "$fund.symbol",
+            "min_investment": "$fund.min_investment",
+            "carry": "$fund.carry"
+        }}
+    ]
+    
+    investments = await db.investments.aggregate(pipeline).to_list(1000)
+    return investments
+
+
 # Fund Routes
 @api_router.post("/funds", response_model=Fund)
-async def create_fund(fund: FundCreate):
+async def create_fund(fund: FundCreate, current_user: User = Depends(get_current_active_user)):
+    if current_user.user_type != UserType.FUND_MANAGER and current_user.user_type != UserType.ADMIN:
+        raise HTTPException(status_code=403, detail="Only fund managers can create funds")
+    
     fund_dict = fund.dict()
     fund_obj = Fund(**fund_dict)
     result = await db.funds.insert_one(fund_obj.dict())
@@ -165,13 +463,13 @@ async def create_fund(fund: FundCreate):
 
 
 @api_router.get("/funds", response_model=List[Fund])
-async def get_funds():
+async def get_funds(current_user: User = Depends(get_current_active_user)):
     funds = await db.funds.find().to_list(1000)
     return [Fund(**fund) for fund in funds]
 
 
 @api_router.get("/funds/{fund_id}", response_model=Fund)
-async def get_fund(fund_id: str):
+async def get_fund(fund_id: str, current_user: User = Depends(get_current_active_user)):
     fund = await db.funds.find_one({"id": fund_id})
     if not fund:
         raise HTTPException(status_code=404, detail="Fund not found")
@@ -180,7 +478,10 @@ async def get_fund(fund_id: str):
 
 # Company Routes
 @api_router.post("/companies", response_model=Company)
-async def create_company(company: CompanyCreate):
+async def create_company(company: CompanyCreate, current_user: User = Depends(get_current_active_user)):
+    if current_user.user_type != UserType.FUND_MANAGER and current_user.user_type != UserType.ADMIN:
+        raise HTTPException(status_code=403, detail="Only fund managers can create companies")
+    
     company_dict = company.dict()
     company_obj = Company(**company_dict)
     result = await db.companies.insert_one(company_obj.dict())
@@ -189,13 +490,13 @@ async def create_company(company: CompanyCreate):
 
 
 @api_router.get("/companies", response_model=List[Company])
-async def get_companies():
+async def get_companies(current_user: User = Depends(get_current_active_user)):
     companies = await db.companies.find().to_list(1000)
     return [Company(**company) for company in companies]
 
 
 @api_router.get("/companies/{company_id}", response_model=Company)
-async def get_company(company_id: str):
+async def get_company(company_id: str, current_user: User = Depends(get_current_active_user)):
     company = await db.companies.find_one({"id": company_id})
     if not company:
         raise HTTPException(status_code=404, detail="Company not found")
@@ -204,7 +505,10 @@ async def get_company(company_id: str):
 
 # Deal Routes
 @api_router.post("/deals", response_model=Deal)
-async def create_deal(deal: DealCreate):
+async def create_deal(deal: DealCreate, current_user: User = Depends(get_current_active_user)):
+    if current_user.user_type != UserType.FUND_MANAGER and current_user.user_type != UserType.ADMIN:
+        raise HTTPException(status_code=403, detail="Only fund managers can create deals")
+    
     deal_dict = deal.dict()
     deal_obj = Deal(**deal_dict)
     result = await db.deals.insert_one(deal_obj.dict())
@@ -213,13 +517,13 @@ async def create_deal(deal: DealCreate):
 
 
 @api_router.get("/deals", response_model=List[Deal])
-async def get_deals():
+async def get_deals(current_user: User = Depends(get_current_active_user)):
     deals = await db.deals.find().to_list(1000)
     return [Deal(**deal) for deal in deals]
 
 
 @api_router.get("/deals/{deal_id}", response_model=Deal)
-async def get_deal(deal_id: str):
+async def get_deal(deal_id: str, current_user: User = Depends(get_current_active_user)):
     deal = await db.deals.find_one({"id": deal_id})
     if not deal:
         raise HTTPException(status_code=404, detail="Deal not found")
@@ -307,6 +611,31 @@ async def get_featured_items():
     }
 
 
+# Protected Featured API (for authenticated users only)
+@api_router.get("/featured/protected")
+async def get_protected_featured_items(current_user: User = Depends(get_current_active_user)):
+    """Get featured funds and deals for authenticated users"""
+    # Get the regular featured data
+    featured_data = await get_featured_items()
+    
+    # Add user's investments if they exist
+    user_investments = await db.investments.find({"user_id": current_user.id}).to_list(100)
+    user_investments = [
+        {
+            "id": investment["id"],
+            "fund_id": investment["fund_id"],
+            "amount": investment["amount"],
+            "status": investment["status"],
+            "created_at": investment["created_at"]
+        }
+        for investment in user_investments
+    ]
+    
+    featured_data["user_investments"] = user_investments
+    
+    return featured_data
+
+
 # Seed initial data if none exists
 @app.on_event("startup")
 async def seed_initial_data():
@@ -314,6 +643,7 @@ async def seed_initial_data():
     fund_count = await db.funds.count_documents({})
     company_count = await db.companies.count_documents({})
     deal_count = await db.deals.count_documents({})
+    user_count = await db.users.count_documents({})
     
     if fund_count == 0:
         # Seed Demo Day Funds
@@ -544,6 +874,54 @@ async def seed_initial_data():
             },
         ]
         await db.deals.insert_many(deals)
+    
+    if user_count == 0:
+        # Create a test admin user
+        admin_user = {
+            "id": str(uuid.uuid4()),
+            "email": "admin@limited.com",
+            "first_name": "Admin",
+            "last_name": "User",
+            "company_name": "Limited",
+            "user_type": UserType.ADMIN,
+            "is_accredited": True,
+            "status": UserStatus.VERIFIED,
+            "hashed_password": get_password_hash("admin123"),
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow()
+        }
+        
+        # Create a test fund manager
+        fund_manager = {
+            "id": str(uuid.uuid4()),
+            "email": "manager@limited.com",
+            "first_name": "Fund",
+            "last_name": "Manager",
+            "company_name": "YC Ventures",
+            "user_type": UserType.FUND_MANAGER,
+            "is_accredited": True,
+            "status": UserStatus.VERIFIED,
+            "hashed_password": get_password_hash("manager123"),
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow()
+        }
+        
+        # Create a test LP
+        lp_user = {
+            "id": str(uuid.uuid4()),
+            "email": "investor@limited.com",
+            "first_name": "Limited",
+            "last_name": "Partner",
+            "company_name": "Doremus Family Office",
+            "user_type": UserType.LP,
+            "is_accredited": True,
+            "status": UserStatus.VERIFIED,
+            "hashed_password": get_password_hash("investor123"),
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow()
+        }
+        
+        await db.users.insert_many([admin_user, fund_manager, lp_user])
 
 
 # Add your routes to the router instead of directly to app
