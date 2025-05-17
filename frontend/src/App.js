@@ -789,23 +789,74 @@ const FinAI = () => (
 
 function App() {
   return (
-    <div className="App bg-black min-h-screen text-white">
-      <BrowserRouter>
-        <div className="flex">
-          <Sidebar />
-          <Routes>
-            <Route path="/" element={<Home />} />
-            <Route path="/funds" element={<Funds />} />
-            <Route path="/companies" element={<Companies />} />
-            <Route path="/portfolio" element={<Portfolio />} />
-            <Route path="/invites" element={<Invites />} />
-            <Route path="/transactions" element={<Transactions />} />
-            <Route path="/network" element={<Network />} />
-            <Route path="/fin-ai" element={<FinAI />} />
-          </Routes>
-        </div>
-      </BrowserRouter>
-    </div>
+    <AuthProvider>
+      <div className="App bg-black min-h-screen text-white">
+        <BrowserRouter>
+          <div className="flex">
+            <Sidebar />
+            <Routes>
+              {/* Public Routes */}
+              <Route path="/" element={<Home />} />
+              <Route path="/funds" element={<Funds />} />
+              <Route path="/companies" element={<Companies />} />
+              <Route path="/login" element={<LoginForm />} />
+              <Route path="/register" element={<RegisterForm />} />
+              <Route path="/fin-ai" element={<FinAI />} />
+              
+              {/* Protected Routes */}
+              <Route
+                path="/funds/:fundId"
+                element={
+                  <ProtectedRoute>
+                    <FundDetail />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/portfolio"
+                element={
+                  <ProtectedRoute>
+                    <PortfolioPage />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/profile"
+                element={
+                  <ProtectedRoute>
+                    <ProfilePage />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/invites"
+                element={
+                  <ProtectedRoute>
+                    <Invites />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/transactions"
+                element={
+                  <ProtectedRoute>
+                    <Transactions />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/network"
+                element={
+                  <ProtectedRoute>
+                    <Network />
+                  </ProtectedRoute>
+                }
+              />
+            </Routes>
+          </div>
+        </BrowserRouter>
+      </div>
+    </AuthProvider>
   );
 }
 
